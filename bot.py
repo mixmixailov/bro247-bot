@@ -85,18 +85,34 @@ def build_prompt(uid: int) -> str:
     d = user_data.get(str(uid), {})
     style = d.get("style", "street")
     l = d.get("language", "RU")
-    gender = d.get("gender")
+    gender = d.get("gender", "")
     persona = d.get("persona", {})
-    lines = [f"{k}: {', '.join(v) if isinstance(v, list) else v}" for k, v in persona.items()]
-    if gender:
-        lines.append("Пользователь — женщина." if gender == "female" and l == "RU" else ("User is female." if gender == "female" else "Пользователь — мужчина." if l == "RU" else "User is male."))
-    extra = "\n".join(lines)
-    mapping = {
-        "street": "Ты дерзкий, но дружелюбный уличный бро. Мотивируй." if l == "RU" else "You are a street‑smart AI bro. Casual and motivating.",
-        "psych": "Ты спокойный психолог‑ассистент. Эмпатия." if l == "RU" else "You are a calm psychological assistant. Empathic.",
-        "coach": "Ты энергичный лайф‑коуч. Дай действия." if l == "RU" else "You are an energetic life coach. Action‑oriented.",
-    }
-    return mapping.get(style, mapping["street"]) + ("\n" + extra if extra else "")
+    name = d.get("name", "пользователь" if l == "RU" else "user")
+
+    if l == "RU":
+        gender_line = "женщина" if gender == "female" else "мужчина" if gender == "male" else "человек"
+    else:
+        gender_line = "female" if gender == "female" else "male" if gender == "male" else "person"
+
+    traits = [f"{k}: {', '.join(v) if isinstance(v, list) else v}" for k, v in persona.items()]
+    traits.append(f"Имя: {name}" if l == "RU" else f"Name: {name}")
+    traits.append(f"Пол: {gender_line}" if l == "RU" else f"Gender: {gender_line}")
+    extra = "".join(traits)
+
+    if l == "RU":
+        style_prompt = {
+            "street": "Ты уличный бот-бро. Говори просто, с юмором, можешь вставлять лёгкий сленг, немного неформальности. Главное — поддержка и уверенность.",
+            "coach": "Ты коуч и наставник. Говоришь уверенно, мотивируешь, даёшь советы чётко и по делу.",
+            "psych": "Ты психолог. Говоришь мягко, внимательно, с эмпатией. Помогаешь разобраться в чувствах, задаёшь наводящие вопросы."
+        }
+    else:
+        style_prompt = {
+            "street": "You're a street-style AI bro. Speak casually, with slang and humor. Be confident and supportive.",
+            "coach": "You're a motivational coach. Speak clearly, confidently, and give concrete, action-oriented advice.",
+            "psych": "You're an empathetic psychologist. Speak gently and attentively, help the user understand their emotions and thoughts."
+        }
+
+    return style_prompt.get(style, "") + "" + extra
 
 # ╔═ PARSE DELAY ══════════════════════════════════╗
 R_MIN_RU = re.compile(r"через\s+(\d+)\s*мин(?:ут[ыу]?)?\s+(.*)", re.I)
@@ -179,17 +195,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     delay = parse_delay(text, l)
     if delay:
+    # если указано точное время
         if isinstance(delay[0], datetime.datetime):
             dt, msg = delay
             reminders.append({"uid": uid, "at": dt.isoformat(), "msg": msg})
             json.dump(reminders, open(REM_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
             await update.message.reply_text(T[l]["rem_save"].format(d=dt.strftime("%d.%m.%Y %H:%M"), m=msg))
             return
-        reminders.append({"uid": uid, "at": (datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)).isoformat(), "msg": msg})
-        json.dump(reminders, open(REM_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-        formatted_time = f"{minutes} мин" if l == "RU" else f"{minutes} min"
-        await update.message.reply_text(T[l]["rem_save"].format(d=formatted_time, m=msg))
-        return
+
+    # если указано количество минут
+        elif isinstance(delay, tuple) and len(delay) == 2:
+            minutes, msg = delay
+            at_time = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=minutes)).isoformat()
+            reminders.append({"uid": uid, "at": at_time, "msg": msg})
+            json.dump(reminders, open(REM_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            formatted_time = f"{minutes} МИН" if l == "RU" else f"{minutes} MIN"
+            await update.message.reply_text(T[l]["rem_save"].format(d=formatted_time, m=msg))
+            return
+
+
 
     prompt = build_prompt(uid)
     chat_history = user_ctx.setdefault(uid, [])
@@ -208,7 +232,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reminder_loop(app):
     while True:
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.UTC)
         due = [r for r in reminders if datetime.datetime.fromisoformat(r["at"]) <= now]
         for r in due:
             try:
@@ -220,15 +244,33 @@ async def reminder_loop(app):
             json.dump(reminders, open(REM_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
         await asyncio.sleep(30)
 
+async def post_start(app):
+    await asyncio.sleep(5)
+    asyncio.create_task(reminder_loop(app))
+    print("🤖 Bro 24/7 запущен …")
+
 def build_app():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_start)  
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
 
 if __name__ == "__main__":
+    import asyncio
+    import sys
+
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     app = build_app()
-    asyncio.get_event_loop().create_task(reminder_loop(app))
-    print("🤖 Bro 24/7 запущен …")
+    print("🤖 Bro 24/7 запущен …")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+
