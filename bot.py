@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import datetime
@@ -7,7 +6,9 @@ import logging
 import re
 from typing import Dict, Any, Tuple, List
 
+import aiofiles
 from dotenv import load_dotenv
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -17,28 +18,47 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.ext._application import Application
+from telegram.constants import UpdateType
 from openai import OpenAI
 
 # ╔═ ENV & LOG ═══════════════════════════════════╗
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # Например, https://your-bot.onrender.com
+WEBHOOK_PATH = f"/webhook/{TELEGRAM_TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not WEBHOOK_HOST:
     raise RuntimeError("❌ .env not loaded или переменные окружения отсутствуют!")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ╔═ FILE PATHS ══════════════════════════════════╗
 BASE = os.path.dirname(__file__)
 USER_JSON = os.path.join(BASE, "user_data.json")
 REM_JSON = os.path.join(BASE, "reminders.json")
+CTX_JSON = os.path.join(BASE, "user_ctx.json")
 
-user_data: Dict[str, Any] = json.load(open(USER_JSON, encoding="utf-8")) if os.path.exists(USER_JSON) else {}
-reminders: List[Dict[str, Any]] = json.load(open(REM_JSON, encoding="utf-8")) if os.path.exists(REM_JSON) else []
-user_ctx: Dict[int, list] = {}
+def safe_load_json(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Ошибка загрузки {path}: {e}")
+        return default
 
-# ╔═ I18N ════════════════════════════════════════╗
+async def async_save_json(path: str, data):
+    async with aiofiles.open(path, "w", encoding="utf-8") as f:
+        await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+
+user_data: Dict[str, Any] = safe_load_json(USER_JSON, {})
+reminders: List[Dict[str, Any]] = safe_load_json(REM_JSON, [])
+user_ctx: Dict[int, list] = safe_load_json(CTX_JSON, {})
+
 T = {
     "RU": {
         "lang": "🌐 Язык", "style": "🎭 Стиль", "rem": "⏰ Напоминание", "gen": "🧬 Пол", "prof": "🧠 Профиль", "clr": "🧹 Сброс",
@@ -68,7 +88,6 @@ T = {
     },
 }
 
-# ╔═ HELPERS ═════════════════════════════════════╗
 def L(uid: int) -> str:
     return user_data.get(str(uid), {}).get("language", "RU")
 
@@ -80,7 +99,12 @@ def KB(l: str):
         [InlineKeyboardButton(t["prof"], callback_data="prof"), InlineKeyboardButton(t["clr"], callback_data="clear")],
     ])
 
-# ╔═ PROMPT BUILDER ═══════════════════════════════╗
+async def send_reply(msg_func, text: str, **kwargs):
+    try:
+        await msg_func(text, **kwargs)
+    except Exception as e:
+        logging.error(f"Ошибка отправки сообщения: {e}")
+
 def build_prompt(uid: int) -> str:
     d = user_data.get(str(uid), {})
     style = d.get("style", "street")
@@ -101,7 +125,7 @@ def build_prompt(uid: int) -> str:
 
     if l == "RU":
         style_prompt = {
-            "street": "Ты уличный бот-бро. Говори просто, с юмором, можешь вставлять лёгкий сленг, немного неформальности. Главное — поддержка и уверенность.",
+            "street": "Ты уличный бро. Говори просто, с юмором, можешь вставлять лёгкий сленг, немного неформальности. Главное — поддержка и уверенность.",
             "coach": "Ты коуч и наставник. Говоришь уверенно, мотивируешь, даёшь советы чётко и по делу.",
             "psych": "Ты психолог. Говоришь мягко, внимательно, с эмпатией. Помогаешь разобраться в чувствах, задаёшь наводящие вопросы."
         }
@@ -114,7 +138,23 @@ def build_prompt(uid: int) -> str:
 
     return style_prompt.get(style, "") + "" + extra
 
-# ╔═ PARSE DELAY ══════════════════════════════════╗
+async def ask_openai(uid: int, text: str) -> str:
+    prompt = build_prompt(uid)
+    chat_history = user_ctx.setdefault(uid, [])
+    chat_history.append({"role": "user", "content": text})
+    user_ctx[uid] = chat_history[-12:]
+    messages = [{"role": "system", "content": prompt}] + user_ctx[uid]
+    try:
+        response = client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
+        reply = response.choices[0].message.content
+    except Exception as e:
+        logging.error(f"OpenAI Error: {e}")
+        reply = T[L(uid)]["err"]
+    chat_history.append({"role": "assistant", "content": reply})
+    user_ctx[uid] = chat_history[-12:]
+    await async_save_json(CTX_JSON, user_ctx)
+    return reply
+
 R_MIN_RU = re.compile(r"через\s+(\d+)\s*мин(?:ут[ыу]?)?\s+(.*)", re.I)
 R_HR_RU = re.compile(r"через\s+(\d+)\s*час(?:а|ов)?\s+(.*)", re.I)
 R_MIN_EN = re.compile(r"in\s+(\d+)\s*min(?:s|utes)?\s+(.*)", re.I)
@@ -134,60 +174,61 @@ def parse_delay(text: str, l: str) -> Tuple[int | datetime.datetime, str] | None
     num = int(m.group(1))
     minutes = num * 60 if 'hour' in m.re.pattern or 'час' in m.re.pattern else num
     return minutes, m.group(2).strip() or ("Без текста" if l == "RU" else "No text")
-# ╔═ HANDLERS ═════════════════════════════════════╗
-async def start(update: Update, _): await update.message.reply_text(T[L(update.effective_user.id)]["welcome"], reply_markup=KB(L(update.effective_user.id)))
+
+async def start(update: Update, _):
+    await send_reply(update.message.reply_text, T[L(update.effective_user.id)]["welcome"], reply_markup=KB(L(update.effective_user.id)))
 
 async def on_buttons(update: Update, _):
-    global user_data
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     uid, sid = q.from_user.id, str(q.from_user.id)
-    l = L(uid); t = T[l]
+    l = L(uid)
+    t = T[l]
 
     if q.data == "lang":
-        await q.message.reply_text("🇷🇺 | 🇬🇧", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("RU", callback_data="lang_RU"), InlineKeyboardButton("EN", callback_data="lang_EN")]])); return
-    if q.data.startswith("lang_"):
+        await send_reply(q.message.reply_text, "🇷🇺 | 🇬🇧", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("RU", callback_data="lang_RU"), InlineKeyboardButton("EN", callback_data="lang_EN")]]))
+    elif q.data.startswith("lang_"):
         user_data.setdefault(sid, {})["language"] = q.data.split("_")[1]
-        json.dump(user_data, open(USER_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-        await q.edit_message_text(T[L(uid)]["lang_set"], reply_markup=KB(L(uid))); return
+        await async_save_json(USER_JSON, user_data)
+        await q.edit_message_text(T[L(uid)]["lang_set"], reply_markup=KB(L(uid)))
 
-    if q.data == "gender":
+    elif q.data == "gender":
         k = [[InlineKeyboardButton("🚹 " + t["male"], callback_data="g_male"), InlineKeyboardButton("🚺 " + t["female"], callback_data="g_female"), InlineKeyboardButton("❌ " + t["skip"], callback_data="g_skip")]]
-        await q.message.reply_text(t["q_gen"], reply_markup=InlineKeyboardMarkup(k)); return
-    if q.data.startswith("g_"):
+        await send_reply(q.message.reply_text, t["q_gen"], reply_markup=InlineKeyboardMarkup(k))
+    elif q.data.startswith("g_"):
         g = q.data.split("_")[1]
         if g == "skip":
             user_data.setdefault(sid, {}).pop("gender", None)
-            await q.message.reply_text(t["reset"])
+            await send_reply(q.message.reply_text, t["reset"])
         else:
             user_data.setdefault(sid, {})["gender"] = "female" if g == "female" else "male"
-            await q.message.reply_text(t["saved"].format(t[g]))
-        json.dump(user_data, open(USER_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2); return
+            await send_reply(q.message.reply_text, t["saved"].format(t[g]))
+        await async_save_json(USER_JSON, user_data)
 
-    if q.data == "style":
+    elif q.data == "style":
         kb_s = [
             [InlineKeyboardButton(t["style_street"], callback_data="s_street")],
             [InlineKeyboardButton(t["style_psych"], callback_data="s_psych")],
             [InlineKeyboardButton(t["style_coach"], callback_data="s_coach")]
         ]
-        await q.message.reply_text(t["choose_style"], reply_markup=InlineKeyboardMarkup(kb_s))
-        return
-    if q.data.startswith("s_"):
+        await send_reply(q.message.reply_text, t["choose_style"], reply_markup=InlineKeyboardMarkup(kb_s))
+    elif q.data.startswith("s_"):
         user_data.setdefault(sid, {})["style"] = q.data.split("_")[1]
-        json.dump(user_data, open(USER_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-        await q.message.reply_text(t["style_ok"]); return
+        await async_save_json(USER_JSON, user_data)
+        await send_reply(q.message.reply_text, t["style_ok"])
 
-    if q.data == "rem":
-        await q.message.reply_text(t["rem_fmt"]); return
+    elif q.data == "rem":
+        await send_reply(q.message.reply_text, t["rem_fmt"])
 
-    if q.data == "prof":
+    elif q.data == "prof":
         d = user_data.get(sid, {})
         prof_lines = [f"{t['lang']}: {d.get('language', '-')}", f"{t['style']}: {d.get('style', '-')}", f"{t['gen']}: {t.get(d.get('gender'), '-') if d.get('gender') else '-'}"]
-        await q.message.reply_text("\n".join(prof_lines)); return
+        await send_reply(q.message.reply_text, "\n".join(prof_lines))
 
-    if q.data == "clear":
+    elif q.data == "clear":
         user_data.pop(sid, None)
-        json.dump(user_data, open(USER_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-        await q.message.reply_text(t["cleared"]); return
+        await async_save_json(USER_JSON, user_data)
+        await send_reply(q.message.reply_text, t["cleared"])
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid, l = update.effective_user.id, L(update.effective_user.id)
@@ -195,40 +236,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     delay = parse_delay(text, l)
     if delay:
-    # если указано точное время
         if isinstance(delay[0], datetime.datetime):
             dt, msg = delay
             reminders.append({"uid": uid, "at": dt.isoformat(), "msg": msg})
-            json.dump(reminders, open(REM_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-            await update.message.reply_text(T[l]["rem_save"].format(d=dt.strftime("%d.%m.%Y %H:%M"), m=msg))
+            await async_save_json(REM_JSON, reminders)
+            await send_reply(update.message.reply_text, T[l]["rem_save"].format(d=dt.strftime("%d.%m.%Y %H:%M"), m=msg))
             return
-
-    # если указано количество минут
         elif isinstance(delay, tuple) and len(delay) == 2:
             minutes, msg = delay
             at_time = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=minutes)).isoformat()
             reminders.append({"uid": uid, "at": at_time, "msg": msg})
-            json.dump(reminders, open(REM_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            await async_save_json(REM_JSON, reminders)
             formatted_time = f"{minutes} МИН" if l == "RU" else f"{minutes} MIN"
-            await update.message.reply_text(T[l]["rem_save"].format(d=formatted_time, m=msg))
+            await send_reply(update.message.reply_text, T[l]["rem_save"].format(d=formatted_time, m=msg))
             return
 
-
-
-    prompt = build_prompt(uid)
-    chat_history = user_ctx.setdefault(uid, [])
-    chat_history.append({"role": "user", "content": text})
-    messages = [{"role": "system", "content": prompt}] + chat_history[-10:]
-
-    try:
-        response = client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
-        reply = response.choices[0].message.content
-    except Exception as e:
-        logging.error(f"OpenAI Error: {e}")
-        reply = T[l]["err"]
-
-    chat_history.append({"role": "assistant", "content": reply})
-    await update.message.reply_text(reply)
+    reply = await ask_openai(uid, text)
+    await send_reply(update.message.reply_text, reply)
 
 async def reminder_loop(app):
     while True:
@@ -240,8 +264,9 @@ async def reminder_loop(app):
             except Exception as e:
                 logging.error(f"Reminder send error: {e}")
         if due:
-            reminders[:] = [r for r in reminders if r not in due]
-            json.dump(reminders, open(REM_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            for r in due:
+                reminders.remove(r)
+            await async_save_json(REM_JSON, reminders)
         await asyncio.sleep(30)
 
 async def post_start(app):
@@ -249,11 +274,11 @@ async def post_start(app):
     asyncio.create_task(reminder_loop(app))
     print("🤖 Bro 24/7 запущен …")
 
-def build_app():
+def build_app() -> Application:
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .post_init(post_start)  
+        .post_init(post_start)
         .build()
     )
     app.add_handler(CommandHandler("start", start))
@@ -261,16 +286,71 @@ def build_app():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
 
+# ---- FLASK WEBHOOK ----
+app_flask = Flask(__name__)
+tg_app: Application = build_app()
+
+@app_flask.route(WEBHOOK_PATH, methods=["POST"])
+def webhook_handler():
+    update = Update.de_json(request.get_json(force=True), tg_app.bot)
+    tg_app.update_queue.put_nowait(update)
+    return "ok", 200
+
+@app_flask.route("/", methods=["GET"])
+def root():
+    return "Bro 24/7 is alive!", 200
+
+def setup_webhook():
+    import requests
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+    webhook_url = WEBHOOK_URL
+    r = requests.post(url, json={"url": webhook_url})
+    print(f"Webhook setup response: {r.text}")
+
 if __name__ == "__main__":
-    import asyncio
     import sys
 
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    app = build_app()
-    print("🤖 Bro 24/7 запущен …")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Установка webhook один раз (или при каждом старте)
+    setup_webhook()
+    # Запуск Flask сервера
+    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 
 
+# ╔═ ДОПОЛНЕНИЯ И УЛУЧШЕНИЯ ════════════════════════════════════════════════════════════════════════════╗
+
+# Закрытие соединений (если будут использоваться базы SQLite в будущем)
+def close_connections():
+    logging.info("Закрытие соединений и сохранение данных...")
+    import atexit
+    atexit.register(lambda: asyncio.run(async_save_json(USER_JSON, user_data)))
+    atexit.register(lambda: asyncio.run(async_save_json(REM_JSON, reminders)))
+    atexit.register(lambda: asyncio.run(async_save_json(CTX_JSON, user_ctx)))
+
+close_connections()
+
+# Дополнительная проверка переменных окружения с отдельными ошибками
+required_env_vars = ["TELEGRAM_TOKEN", "OPENAI_API_KEY", "WEBHOOK_HOST"]
+for var in required_env_vars:
+    if not os.getenv(var):
+        raise RuntimeError(f"❌ Переменная окружения {var} не установлена!")
+
+# Безопасность: защита от SQL-инъекций в потенциальных динамических полях (если будут)
+SAFE_FIELDS = {"style", "language", "gender", "persona", "name"}
+def is_safe_field(field: str) -> bool:
+    return field in SAFE_FIELDS
+
+# Кэширование (пример — можно развить в будущем)
+user_cache = {}
+def get_user_cached(uid: str):
+    if uid in user_cache:
+        return user_cache[uid]
+    user = user_data.get(uid, {})
+    user_cache[uid] = user
+    return user
+
+# Пример заготовки под миграции (в будущем — через Alembic)
+def run_db_migrations():
+    logging.info("Проверка и применение миграций… (в будущем подключить Alembic)")
+
+run_db_migrations()
